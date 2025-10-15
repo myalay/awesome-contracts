@@ -124,7 +124,7 @@ modifier isHuman() {
 
 **目的**：防止智能合约机器人操纵游戏
 
-**但是**：这个防护后来被证明可以绕过！
+**但是**：这个防护[可以绕过](COMMENT.md#extcodesize-extcodesize漏洞)！
 
 ### 2. 限制单笔金额
 
