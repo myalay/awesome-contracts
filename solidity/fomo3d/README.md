@@ -371,6 +371,7 @@ struct Round {
 2. Gas 优化技巧
 3. 事件驱动架构
 4. 模块化设计
+5. [巧妙的 Mask 算法的分红机制设计](COMMENT.md#fomo3d-分红机制%20-%20Mask算法)
 
 ### 经济学角度
 

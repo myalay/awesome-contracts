@@ -225,3 +225,253 @@ assembly {
 - **教训**：不要依赖 `extcodesize` 来区分用户和合约
 
 这也是为什么 Fomo3D 被列为研究案例的原因之一 —— 它展示了一个看似聪明但实际无效的安全机制！🔴
+
+---
+
+## Fomo3D 的分红机制 - Mask算法
+
+Fomo3D 使用了一个非常巧妙的 **Mask 算法**来实现 **O(1) 复杂度**的多人分红，无需遍历所有玩家。
+
+### 核心问题
+
+如何在 Gas 费用有限的情况下，高效地给成千上万个持有 Keys 的玩家分配分红？
+
+❌ **低效方法**（不可行）：
+```solidity
+// 遍历所有玩家 - Gas 费用极高！
+for (uint i = 0; i < allPlayers.length; i++) {
+    dividends[players[i]] += earnings * keys[players[i]] / totalKeys;
+}
+```
+
+✅ **高效方法**（Mask 算法）：
+```solidity
+// O(1) 复杂度 - 只更新全局变量！
+round_[_rID].mask += profitPerKey;
+```
+
+### Mask 算法原理
+
+#### 核心数据结构
+
+```solidity
+// 全局：回合级别
+struct Round {
+    uint256 mask;      // 累积的每 Key 收益（放大 1e18 倍）
+    uint256 keys;      // 总 Keys 数量
+    uint256 pot;       // 奖池
+    // ... 其他字段
+}
+
+// 个人：玩家在某回合的数据
+struct PlayerRounds {
+    uint256 keys;      // 玩家持有的 Keys 数量
+    uint256 mask;      // 玩家的收益掩码（已结算的收益）
+}
+```
+
+#### 算法步骤
+
+**1️⃣ 当有收益需要分配时（有人购买 Keys）**
+
+```solidity
+function updateMasks(uint256 _rID, uint256 _pID, uint256 _gen, uint256 _keys)
+    private
+    returns(uint256)
+{
+    // 计算每个 Key 的收益（Profit Per Token）
+    // _gen 是要分配的总收益，keys 是总 Key 数
+    uint256 _ppt = (_gen * 1e18) / round_[_rID].keys;
+    
+    // 🔑 关键：更新全局 mask（累加）
+    round_[_rID].mask = _ppt + round_[_rID].mask;
+    
+    // 更新玩家的 mask（防止自己给自己分红）
+    uint256 _pearn = (_ppt * _keys) / 1e18;
+    plyrRnds_[_pID][_rID].mask = 
+        (((round_[_rID].mask * _keys) / 1e18) - _pearn) + plyrRnds_[_pID][_rID].mask;
+    
+    // 返回精度损失的尘埃（dust）
+    return(_gen - (_ppt * round_[_rID].keys) / 1e18);
+}
+```
+
+**2️⃣ 计算玩家未领取的收益**
+
+```solidity
+function calcUnMaskedEarnings(uint256 _pID, uint256 _rIDlast)
+    private
+    view
+    returns(uint256)
+{
+    // 公式：(全局 mask × 我的 Keys) - 我的 mask
+    return (
+        ((round_[_rIDlast].mask * plyrRnds_[_pID][_rIDlast].keys) / 1e18) 
+        - plyrRnds_[_pID][_rIDlast].mask
+    );
+}
+```
+
+### 工作流程示例
+
+假设有 3 个玩家：
+
+```
+初始状态：
+- Alice: 100 Keys
+- Bob:   200 Keys  
+- Carol: 200 Keys
+- 总计:  500 Keys
+- round.mask = 0
+- 所有玩家的 mask = 0
+```
+
+**第 1 轮分红：分配 10 ETH**
+
+```solidity
+// 每 Key 收益 = 10 ETH / 500 Keys = 0.02 ETH
+ppt = (10 * 1e18) / 500 = 0.02 * 1e18
+
+// 更新全局 mask
+round.mask = 0 + 0.02e18 = 0.02e18
+
+// 各玩家应得收益：
+Alice: 100 * 0.02 = 2 ETH  ✅
+Bob:   200 * 0.02 = 4 ETH  ✅
+Carol: 200 * 0.02 = 4 ETH  ✅
+```
+
+**第 2 轮分红：再分配 5 ETH**
+
+```solidity
+// 每 Key 收益 = 5 ETH / 500 Keys = 0.01 ETH
+ppt = (5 * 1e18) / 500 = 0.01 * 1e18
+
+// 更新全局 mask（累加）
+round.mask = 0.02e18 + 0.01e18 = 0.03e18
+
+// 各玩家累计收益：
+Alice: 100 * 0.03 = 3 ETH  ✅ (第1轮 2 + 第2轮 1)
+Bob:   200 * 0.03 = 6 ETH  ✅ (第1轮 4 + 第2轮 2)
+Carol: 200 * 0.03 = 6 ETH  ✅ (第1轮 4 + 第2轮 2)
+```
+
+**Alice 提取收益后**
+
+```solidity
+// Alice 提取 3 ETH
+alice.mask = 0.03e18 * 100 = 3e18  // 标记已提取
+
+// 再次计算 Alice 的收益
+earnings = (round.mask * alice.keys) / 1e18 - alice.mask
+         = (0.03e18 * 100) / 1e18 - 3
+         = 3 - 3 = 0 ✅ 正确！
+```
+
+### 资金分配流程
+
+每次有人购买 Keys 时，ETH 被这样分配：
+
+```solidity
+function distributeInternal(uint256 _rID, uint256 _pID, uint256 _eth, ...)
+{
+    // 假设收到 100 ETH
+    
+    // 1. 计算分红份额（假设 40%）
+    uint256 _gen = (_eth * 40) / 100;  // 40 ETH 给所有 Key 持有者
+    
+    // 2. 空投池（1%）
+    uint256 _air = _eth / 100;         // 1 ETH
+    airDropPot_ += _air;
+    
+    // 3. 扣除外部分配（14% + P3D份额）
+    _eth = _eth.sub(固定费用);
+    
+    // 4. 剩余的进入奖池
+    uint256 _pot = _eth.sub(_gen);     // 剩余进入奖池
+    
+    // 5. 🔑 更新 mask 分配收益（O(1) 操作！）
+    uint256 _dust = updateMasks(_rID, _pID, _gen, _keys);
+    
+    // 6. 尘埃归入奖池
+    round_[_rID].pot = _pot + _dust + round_[_rID].pot;
+}
+```
+
+### 收益类型
+
+玩家有 3 种收益来源：
+
+```solidity
+struct Player {
+    uint256 win;    // 赢得大奖（48%奖池）
+    uint256 gen;    // 分红收益（从 mask 计算）
+    uint256 aff;    // 推荐收益（10%）
+}
+
+// 提取时计算总收益
+function withdrawEarnings(uint256 _pID) private returns(uint256) {
+    // 1. 更新分红收益
+    updateGenVault(_pID, plyr_[_pID].lrnd);
+    
+    // 2. 总收益 = 大奖 + 分红 + 推荐
+    uint256 _earnings = plyr_[_pID].win + plyr_[_pID].gen + plyr_[_pID].aff;
+    
+    // 3. 清零
+    if (_earnings > 0) {
+        plyr_[_pID].win = 0;
+        plyr_[_pID].gen = 0;
+        plyr_[_pID].aff = 0;
+    }
+    
+    return _earnings;
+}
+```
+
+### 技术亮点
+
+✅ **优点**：
+
+1. **O(1) 时间复杂度**：无论有多少玩家，分红只需一次操作
+2. **Gas 高效**：不需要遍历数组，极大节省 Gas
+3. **实时计算**：随时可以查询未领取的收益
+4. **精度处理**：乘以 1e18 避免小数，尘埃归入奖池
+
+❌ **缺点**：
+
+1. **复杂难懂**：新手很难理解 mask 的工作原理
+2. **精度损失**：整数除法会产生"尘埃"（dust）
+3. **依赖全局状态**：round.mask 必须正确维护
+
+### 数学公式
+
+```
+玩家未领取收益 = (全局 mask × 玩家 Keys) - 玩家 mask
+
+其中：
+- 全局 mask = Σ(每次分红金额 / 总Keys)
+- 玩家 mask = 已经结算给该玩家的收益
+
+精度放大系数 = 1e18（避免小数）
+```
+
+### 对比 PoWH3D
+
+Fomo3D 的 Mask 算法和 PoWH3D 的 `profitPerShare` 机制**本质相同**：
+
+| 项目 | 变量名 | 用途 |
+|------|--------|------|
+| Fomo3D | `round.mask` | 累积的每 Key 收益 |
+| PoWH3D | `profitPerShare_` | 累积的每代币收益 |
+| 共同点 | O(1) 分红 | 高效的多人分红算法 |
+
+### 总结
+
+Fomo3D 的分红机制是其**技术上最精彩的部分**之一：
+
+- ✅ **算法巧妙**：Mask 算法实现 O(1) 分红
+- ✅ **Gas 优化**：即使有 10000 个玩家也不会卡住
+- ✅ **数学精准**：精度处理得当（除了微小尘埃）
+- ⚠️ **但依然危险**：技术优秀不等于项目安全
+
+这是一个**值得学习的技术模式**，广泛应用于现代 DeFi 项目中的质押、分红、流动性挖矿等场景。
